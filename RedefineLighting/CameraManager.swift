@@ -14,6 +14,7 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
     private var videoDeviceInput: AVCaptureDeviceInput?
     private var videoDeviceOutput:AVCaptureVideoDataOutput?
     private var videoQueue:DispatchQueue?
+    private var isProcessingFrame = false
 
     @Published var permissionDenied = false
     @Published var isConfigured = false
@@ -113,13 +114,32 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
         from connection: AVCaptureConnection
     ) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-            print("Could not get pixel buffer")
+            print("No pixel buffer")
             return
         }
 
+        guard !isProcessingFrame else {
+            print("Still Processing Frame")
+            return
+        }
+
+        isProcessingFrame = true
+        processFrame(pixelBuffer)
+    }
+
+    private func processFrame(_ pixelBuffer: CVPixelBuffer) {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
 
-        print("Frame size: \(width) x \(height)")
+        DispatchQueue.global(qos: .userInitiated).async {
+            print("START processing frame: \(width) x \(height)")
+
+            Thread.sleep(forTimeInterval: 1.0)
+
+            print("END processing frame")
+
+            self.isProcessingFrame = false
+        }
     }
 }
+
