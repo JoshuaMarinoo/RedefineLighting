@@ -7,11 +7,13 @@
 import AVFoundation
 import UIKit
 import Combine
+import Dispatch
 
-final class CameraManager: NSObject, ObservableObject {
+final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
     private var videoDeviceInput: AVCaptureDeviceInput?
     private var videoDeviceOutput:AVCaptureVideoDataOutput?
+    private var videoQueue:DispatchQueue?
 
     @Published var permissionDenied = false
     @Published var isConfigured = false
@@ -64,6 +66,7 @@ final class CameraManager: NSObject, ObservableObject {
         do {
             let input = try AVCaptureDeviceInput(device: camera)
             let output = AVCaptureVideoDataOutput()
+            let queue = DispatchQueue(label: "VideoQueue")
 
             guard session.canAddInput(input) else {
                 session.commitConfiguration()
@@ -77,6 +80,9 @@ final class CameraManager: NSObject, ObservableObject {
             videoDeviceOutput=output
             session.addInput(input)
             videoDeviceInput=input
+            videoQueue=queue
+            output.setSampleBufferDelegate(self, queue: queue)
+            output.alwaysDiscardsLateVideoFrames = true
             session.commitConfiguration()
             isConfigured = true
         } catch {
@@ -87,7 +93,7 @@ final class CameraManager: NSObject, ObservableObject {
 
     func startSession() {
         guard isConfigured, !session.isRunning else { return }
-
+        
         DispatchQueue.global(qos: .userInitiated).async {
             self.session.startRunning()
         }
@@ -99,5 +105,13 @@ final class CameraManager: NSObject, ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             self.session.stopRunning()
         }
+    }
+    
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        print("Frame received")
     }
 }
