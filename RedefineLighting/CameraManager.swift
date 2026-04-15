@@ -11,6 +11,7 @@ import Combine
 final class CameraManager: NSObject, ObservableObject {
     let session = AVCaptureSession()
     private var videoDeviceInput: AVCaptureDeviceInput?
+    private var videoDeviceOutput:AVCaptureVideoDataOutput?
 
     @Published var permissionDenied = false
     @Published var isConfigured = false
@@ -62,11 +63,18 @@ final class CameraManager: NSObject, ObservableObject {
 
         do {
             let input = try AVCaptureDeviceInput(device: camera)
+            let output = AVCaptureVideoDataOutput()
 
             guard session.canAddInput(input) else {
                 session.commitConfiguration()
                 return
             }
+            guard session.canAddOutput(output) else {
+                session.commitConfiguration()
+                return
+            }
+            session.addOutput(output)
+            videoDeviceOutput=output
             session.addInput(input)
             videoDeviceInput=input
             session.commitConfiguration()
