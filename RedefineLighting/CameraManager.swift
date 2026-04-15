@@ -112,6 +112,14 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        print("Frame received")
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            print("Could not get pixel buffer")
+            return
+        }
+
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+
+        print("Frame size: \(width) x \(height)")
     }
 }
