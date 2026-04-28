@@ -7,13 +7,29 @@
 import AVFoundation
 import UIKit
 import Combine
+import Dispatch
+import CoreML
 
-final class CameraManager: NSObject, ObservableObject {
+struct NormalizedBox {
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+    let confidence: Double
+}
+
+final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
     private var videoDeviceInput: AVCaptureDeviceInput?
+    private var videoDeviceOutput:AVCaptureVideoDataOutput?
+    private var videoQueue:DispatchQueue?
+    private var isProcessingFrame = false
+    let mlModel = try? Redefine_Lighting_1(configuration: .init())
 
     @Published var permissionDenied = false
     @Published var isConfigured = false
+    @Published var detectedBox: NormalizedBox?
+    
 
     override init() {
         super.init()
@@ -62,13 +78,24 @@ final class CameraManager: NSObject, ObservableObject {
 
         do {
             let input = try AVCaptureDeviceInput(device: camera)
+            let output = AVCaptureVideoDataOutput()
+            let queue = DispatchQueue(label: "VideoQueue")
 
             guard session.canAddInput(input) else {
                 session.commitConfiguration()
                 return
             }
+            guard session.canAddOutput(output) else {
+                session.commitConfiguration()
+                return
+            }
+            session.addOutput(output)
+            videoDeviceOutput=output
             session.addInput(input)
             videoDeviceInput=input
+            videoQueue=queue
+            output.setSampleBufferDelegate(self, queue: queue)
+            output.alwaysDiscardsLateVideoFrames = true
             session.commitConfiguration()
             isConfigured = true
         } catch {
@@ -79,7 +106,7 @@ final class CameraManager: NSObject, ObservableObject {
 
     func startSession() {
         guard isConfigured, !session.isRunning else { return }
-
+        
         DispatchQueue.global(qos: .userInitiated).async {
             self.session.startRunning()
         }
@@ -92,4 +119,86 @@ final class CameraManager: NSObject, ObservableObject {
             self.session.stopRunning()
         }
     }
+    
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            print("No pixel buffer")
+            return
+        }
+
+        guard !isProcessingFrame else {
+            print("Still Processing Frame")
+            return
+        }
+
+        isProcessingFrame = true
+        processFrame(pixelBuffer)
+    }
+
+    private func processFrame(_ pixelBuffer: CVPixelBuffer) {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            print("START processing frame: \(width) x \(height)")
+
+            guard let output = try? self.mlModel?.prediction(
+                image: pixelBuffer,
+                iouThreshold: 0.33,
+                confidenceThreshold: 0.7
+            ) else {
+                print("Prediction failed")
+                self.isProcessingFrame = false
+                return
+            }
+
+            if output.coordinates.count != 0 {
+                var bestIndex = -1
+                var bestConfidence = -Double.infinity
+
+                for r in 0..<output.confidence.shape[0].intValue {
+                    let c = output.confidence[[NSNumber(value: r), 0]].doubleValue
+                    if c > bestConfidence {
+                        bestConfidence = c
+                        bestIndex = r
+                    }
+                }
+
+                let detected = NormalizedBox(
+                    x: output.coordinates[[NSNumber(value: bestIndex), NSNumber(value: 0)]].doubleValue,
+                    y: output.coordinates[[NSNumber(value: bestIndex), NSNumber(value: 1)]].doubleValue,
+                    width: output.coordinates[[NSNumber(value: bestIndex), NSNumber(value: 2)]].doubleValue,
+                    height: output.coordinates[[NSNumber(value: bestIndex), NSNumber(value: 3)]].doubleValue,
+                    confidence: output.confidence[[NSNumber(value: bestIndex), NSNumber(value: 0)]].doubleValue
+                )
+
+                DispatchQueue.main.async {
+                    self.detectedBox = detected
+                }
+
+                print(
+                    detected.x,
+                    detected.y,
+                    detected.width,
+                    detected.height,
+                    detected.confidence
+                )
+                print("END processing frame")
+                self.isProcessingFrame = false
+
+            } else {
+                DispatchQueue.main.async {
+                    self.detectedBox = nil
+                }
+
+                print("No Bounding Box Detected")
+                self.isProcessingFrame = false
+            }
+        }
+    }
 }
+
