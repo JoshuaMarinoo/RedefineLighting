@@ -8,6 +8,7 @@ import AVFoundation
 import UIKit
 import Combine
 import Dispatch
+import CoreML
 
 final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
@@ -15,9 +16,11 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
     private var videoDeviceOutput:AVCaptureVideoDataOutput?
     private var videoQueue:DispatchQueue?
     private var isProcessingFrame = false
+    let mlModel = try? Redefine_Lighting_1(configuration: .init())
 
     @Published var permissionDenied = false
     @Published var isConfigured = false
+    
 
     override init() {
         super.init()
@@ -133,9 +136,18 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
 
         DispatchQueue.global(qos: .userInitiated).async {
             print("START processing frame: \(width) x \(height)")
+            
+            guard let output = try? self.mlModel?.prediction(
+                image: pixelBuffer,
+                iouThreshold: 0.33,
+                confidenceThreshold: 0.7
+            ) else {
+                print("Prediction failed")
+                self.isProcessingFrame = false
+                return
+            }
 
-            Thread.sleep(forTimeInterval: 1.0)
-
+            print(output.coordinates)
             print("END processing frame")
 
             self.isProcessingFrame = false
