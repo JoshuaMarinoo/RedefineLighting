@@ -10,6 +10,14 @@ import Combine
 import Dispatch
 import CoreML
 
+struct NormalizedBox {
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+    let confidence: Double
+}
+
 final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
     private var videoDeviceInput: AVCaptureDeviceInput?
@@ -20,6 +28,7 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
 
     @Published var permissionDenied = false
     @Published var isConfigured = false
+    @Published var detectedBox: NormalizedBox?
     
 
     override init() {
@@ -136,7 +145,7 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
 
         DispatchQueue.global(qos: .userInitiated).async {
             print("START processing frame: \(width) x \(height)")
-            
+
             guard let output = try? self.mlModel?.prediction(
                 image: pixelBuffer,
                 iouThreshold: 0.33,
@@ -147,10 +156,48 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
                 return
             }
 
-            print(output.coordinates)
-            print("END processing frame")
+            if output.coordinates.count != 0 {
+                var bestIndex = -1
+                var bestConfidence = -Double.infinity
 
-            self.isProcessingFrame = false
+                for r in 0..<output.confidence.shape[0].intValue {
+                    let c = output.confidence[[NSNumber(value: r), 0]].doubleValue
+                    if c > bestConfidence {
+                        bestConfidence = c
+                        bestIndex = r
+                    }
+                }
+
+                let detected = NormalizedBox(
+                    x: output.coordinates[[NSNumber(value: bestIndex), NSNumber(value: 0)]].doubleValue,
+                    y: output.coordinates[[NSNumber(value: bestIndex), NSNumber(value: 1)]].doubleValue,
+                    width: output.coordinates[[NSNumber(value: bestIndex), NSNumber(value: 2)]].doubleValue,
+                    height: output.coordinates[[NSNumber(value: bestIndex), NSNumber(value: 3)]].doubleValue,
+                    confidence: output.confidence[[NSNumber(value: bestIndex), NSNumber(value: 0)]].doubleValue
+                )
+
+                DispatchQueue.main.async {
+                    self.detectedBox = detected
+                }
+
+                print(
+                    detected.x,
+                    detected.y,
+                    detected.width,
+                    detected.height,
+                    detected.confidence
+                )
+                print("END processing frame")
+                self.isProcessingFrame = false
+
+            } else {
+                DispatchQueue.main.async {
+                    self.detectedBox = nil
+                }
+
+                print("No Bounding Box Detected")
+                self.isProcessingFrame = false
+            }
         }
     }
 }

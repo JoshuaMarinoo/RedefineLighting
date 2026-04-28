@@ -7,35 +7,27 @@
 
 import SwiftUI
 
+import SwiftUI
+
 struct ContentView: View {
     @StateObject private var cameraManager = CameraManager()
 
     var body: some View {
         ZStack {
-            if cameraManager.permissionDenied {
-                VStack(spacing: 12) {
-                    Text("Camera access denied")
-                        .font(.title2)
-                        .bold()
-
-                    Text("Enable camera access in Settings to use marker tracking.")
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal)
-                }
-            } else {
-                CameraPreviewView(session: cameraManager.session)
-                    .ignoresSafeArea()
-            }
+            CameraPreviewView(
+                session: cameraManager.session,
+                detectedBox: cameraManager.detectedBox
+            )
+            .ignoresSafeArea()
         }
         .onAppear {
             cameraManager.checkPermissionAndConfigure()
         }
-        .onChange(of: cameraManager.isConfigured) {
-            if cameraManager.isConfigured {
+        .onChange(of: cameraManager.isConfigured) { _, newValue in
+            if newValue {
                 cameraManager.startSession()
             }
         }
-        
         .onDisappear {
             cameraManager.stopSession()
         }
