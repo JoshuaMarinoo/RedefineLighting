@@ -36,6 +36,7 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
 
     private var isProcessingFrame = false
 
+    // Load the Core ML object detection model once.
     let mlModel = try? Redefine_Lighting_1(configuration: .init())
 
     // -------------------- CAMERA EXPOSURE / SHUTTER TUNING --------------------
@@ -46,21 +47,13 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
     // 60  = 1/60
     // 120 = 1/120
     // 240 = 1/240
-    private let exposureDenominator: Int32 = 60
+    // 360 = 1/360
+    // 480 = 1/480
+    private let exposureDenominator: Int32 = 240
 
     // Raise this if the image gets too dark.
+    // Lower this if the image is overexposed.
     private let exposureISO: Float = 200
-
-    // -------------------- VISION TRACKER STATE --------------------
-    private let visionSequenceHandler = VNSequenceRequestHandler()
-    private var trackingRequest: VNTrackObjectRequest?
-    private var framesSinceDetection = 0
-
-    private let redetectEveryNFrames = 10
-    private let minimumTrackingConfidence: VNConfidence = 0.50
-
-    private var lastTrackedBox: NormalizedBox?
-    private let maxCenterJumpPerFrame = 0.12
 
     // -------------------- HAND POSE / GESTURE STATE --------------------
     @Published var handGesture: HandGesture = .none
@@ -81,6 +74,7 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
     private var stableGestureStartTime: Date?
     private var didFireHeldGesture = false
 
+    // -------------------- PUBLISHED UI STATE --------------------
     @Published var permissionDenied = false
     @Published var isConfigured = false
     @Published var detectedBox: NormalizedBox?
@@ -284,31 +278,15 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
                 self.runHandPose(pixelBuffer)
             }
 
-            if self.shouldUseTracker() {
-                let trackingWorked = self.runTracker(pixelBuffer)
+            self.runDetector(pixelBuffer)
 
-                if trackingWorked {
-                    print("END processing frame using tracker")
-                    return
-                }
-
-                print("Tracker failed. Re-running detector.")
-            }
-
-            self.runDetectorAndStartTracker(pixelBuffer)
-            print("END processing frame using detector")
+            print("END processing frame using detector only")
         }
     }
 
-    private func shouldUseTracker() -> Bool {
-        guard trackingRequest != nil else {
-            return false
-        }
+    // -------------------- CORE ML OBJECT DETECTION --------------------
 
-        return framesSinceDetection < redetectEveryNFrames
-    }
-
-    private func runDetectorAndStartTracker(_ pixelBuffer: CVPixelBuffer) {
+    private func runDetector(_ pixelBuffer: CVPixelBuffer) {
         guard let output = try? self.mlModel?.prediction(
             image: pixelBuffer,
             iouThreshold: 0.33,
@@ -320,7 +298,6 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
                 self.detectedBox = nil
             }
 
-            self.resetTracker()
             return
         }
 
@@ -330,7 +307,6 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
             }
 
             print("No Bounding Box Detected")
-            self.resetTracker()
             return
         }
 
@@ -351,7 +327,6 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
                 self.detectedBox = nil
             }
 
-            self.resetTracker()
             return
         }
 
@@ -375,103 +350,6 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
             detected.height,
             detected.confidence
         )
-
-        self.startTracker(from: detected)
-    }
-
-    private func startTracker(from box: NormalizedBox) {
-        let rect = normalizedRect(from: box)
-
-        let observation = VNDetectedObjectObservation(
-            boundingBox: rect
-        )
-
-        let request = VNTrackObjectRequest(
-            detectedObjectObservation: observation
-        )
-
-        request.trackingLevel = .accurate
-
-        trackingRequest = request
-        framesSinceDetection = 0
-        lastTrackedBox = box
-
-        print("Tracker initialized from detector box:", rect)
-    }
-
-    private func runTracker(_ pixelBuffer: CVPixelBuffer) -> Bool {
-        guard let trackingRequest else {
-            return false
-        }
-
-        do {
-            try visionSequenceHandler.perform(
-                [trackingRequest],
-                on: pixelBuffer
-            )
-        } catch {
-            print("Vision tracking failed:", error.localizedDescription)
-            self.resetTracker()
-            return false
-        }
-
-        guard let observation = trackingRequest.results?.first as? VNDetectedObjectObservation else {
-            print("No tracking observation returned")
-            self.resetTracker()
-            return false
-        }
-
-        guard observation.confidence >= minimumTrackingConfidence else {
-            print("Tracking confidence too low:", observation.confidence)
-            self.resetTracker()
-            return false
-        }
-
-        trackingRequest.inputObservation = observation
-        framesSinceDetection += 1
-
-        let trackedRect = clampedNormalizedRect(observation.boundingBox)
-
-        let trackedBox = normalizedBox(
-            from: trackedRect,
-            confidence: Double(observation.confidence)
-        )
-
-        if let lastTrackedBox {
-            let dx = abs(trackedBox.x - lastTrackedBox.x)
-            let dy = abs(trackedBox.y - lastTrackedBox.y)
-
-            if dx > maxCenterJumpPerFrame || dy > maxCenterJumpPerFrame {
-                print("Tracker jump rejected. dx:", dx, "dy:", dy)
-                self.resetTracker()
-                return false
-            }
-        }
-
-        lastTrackedBox = trackedBox
-
-        DispatchQueue.main.async {
-            self.detectedBox = trackedBox
-        }
-
-        print(
-            "TRACKER:",
-            trackedBox.x,
-            trackedBox.y,
-            trackedBox.width,
-            trackedBox.height,
-            trackedBox.confidence,
-            "framesSinceDetection:",
-            self.framesSinceDetection
-        )
-
-        return true
-    }
-
-    private func resetTracker() {
-        trackingRequest = nil
-        framesSinceDetection = 0
-        lastTrackedBox = nil
     }
 
     // -------------------- HAND POSE HELPERS --------------------
@@ -609,46 +487,5 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
                 print("Held gesture triggered:", gesture)
             }
         }
-    }
-
-    // -------------------- BOX CONVERSION HELPERS --------------------
-
-    private func normalizedRect(from box: NormalizedBox) -> CGRect {
-        let rect = CGRect(
-            x: box.x - box.width / 2.0,
-            y: box.y - box.height / 2.0,
-            width: box.width,
-            height: box.height
-        )
-
-        return clampedNormalizedRect(rect)
-    }
-
-    private func normalizedBox(from rect: CGRect, confidence: Double) -> NormalizedBox {
-        NormalizedBox(
-            x: rect.midX,
-            y: rect.midY,
-            width: rect.width,
-            height: rect.height,
-            confidence: confidence
-        )
-    }
-
-    private func clampedNormalizedRect(_ rect: CGRect) -> CGRect {
-        let x = max(0.0, min(1.0, rect.origin.x))
-        let y = max(0.0, min(1.0, rect.origin.y))
-
-        let maxWidth = 1.0 - x
-        let maxHeight = 1.0 - y
-
-        let width = max(0.001, min(maxWidth, rect.width))
-        let height = max(0.001, min(maxHeight, rect.height))
-
-        return CGRect(
-            x: x,
-            y: y,
-            width: width,
-            height: height
-        )
     }
 }
