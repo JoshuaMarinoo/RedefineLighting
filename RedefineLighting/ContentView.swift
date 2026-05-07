@@ -13,16 +13,31 @@ struct ContentView: View {
     // the capture session, it should not be recreated every time the view redraws.
     @StateObject private var cameraManager = CameraManager()
 
+    // BluetoothManager owns the BLE central connection to the Arduino.
+    // Keeping it as a StateObject means it stays alive while this view is active.
+    @StateObject private var bluetoothManager = BluetoothManager()
+
     var body: some View {
         // ZStack layers views on top of each other.
-        // Right now the preview fills the screen, and the detection overlay
-        // is handled inside CameraPreviewView / PreviewUIView.
+        // The camera preview fills the screen, and the Bluetooth status
+        // is shown as a small overlay at the top.
         ZStack {
             CameraPreviewView(
                 session: cameraManager.session,
                 detectedBox: cameraManager.detectedBox
             )
             .ignoresSafeArea()
+
+            VStack {
+                Text(bluetoothManager.bluetoothStatus)
+                    .padding()
+                    .background(.black.opacity(0.6))
+                    .foregroundStyle(.white)
+                    .cornerRadius(8)
+
+                Spacer()
+            }
+            .padding()
         }
         // When the view appears, first check camera permission and configure
         // the session if access is available.
@@ -36,6 +51,11 @@ struct ContentView: View {
             if newValue {
                 cameraManager.startSession()
             }
+        }
+        // Whenever CameraManager publishes a new detection, ask BluetoothManager
+        // to send the center coordinates if they changed enough.
+        .onChange(of: cameraManager.detectedBox) { _, newBox in
+            bluetoothManager.sendDynamixelCommandIfNeeded(newBox)
         }
         // Stop the camera session when the view disappears so the app is not
         // still capturing frames in the background.
