@@ -11,36 +11,38 @@ final class BluetoothManager: NSObject, ObservableObject {
     @Published var bluetoothStatus: String = "Not started"
     @Published var isConnected: Bool = false
 
+    // This controls whether the iPhone sends new G<angle> movement commands.
+    // When false, the motor should hold its last position because Arduino torque stays ON.
+    @Published var servoCommandsEnabled: Bool = true
+
     private var centralManager: CBCentralManager?
     private var arduinoPeripheral: CBPeripheral?
-    private var boundingBoxCharacteristic: CBCharacteristic?
+    private var commandCharacteristic: CBCharacteristic?
 
     private let serviceUUID = CBUUID(string: "12345678-1234-1234-1234-1234567890AB")
     private let characteristicUUID = CBUUID(string: "87654321-4321-4321-4321-BA0987654321")
 
-    // Store the last center point that actually caused a BLE command.
     private var lastSentCenterX: Double?
     private var lastSentCenterY: Double?
 
-    // Normalized movement thresholds.
-    // 0.03 means the detected center must move about 3% of the normalized frame
-    // before another command is sent.
     private let xChangeThreshold = 0.03
     private let yChangeThreshold = 0.03
 
-    // Dynamixel command mapping.
-    // box.x is normalized from 0 to 1, so the center of the frame is 0.5.
     private let targetCenterX = 0.5
-
-    // This maps normalized x-error to servo degrees.
-    // With gain = 20:
-    // box.x = 0.0 -> +10 degrees
-    // box.x = 0.5 ->   0 degrees
-    // box.x = 1.0 -> -10 degrees
     private let angleGain = 20.0
 
     private let minAngle = -10.0
     private let maxAngle = 10.0
+
+    private var lastSentAngle: Double?
+    private var smoothedAngle: Double?
+    private let smoothingAlpha = 0.25
+    private let angleSendThreshold = 0.5
+    private let minimumSendInterval: TimeInterval = 0.10
+    private var lastSendTime: Date?
+
+    private let ledBrightnessLevels = [0, 25, 50, 75, 100]
+    private var ledBrightnessIndex = 2
 
     override init() {
         super.init()
@@ -52,6 +54,12 @@ final class BluetoothManager: NSObject, ObservableObject {
     }
 
     func sendDynamixelCommandIfNeeded(_ box: NormalizedBox?) {
+        // This is what stops/resumes motor movement.
+        // If false, no new G<angle> commands are sent to the Arduino.
+        guard servoCommandsEnabled else {
+            return
+        }
+
         guard let box else {
             return
         }
@@ -60,46 +68,60 @@ final class BluetoothManager: NSObject, ObservableObject {
             return
         }
 
-        guard let boundingBoxCharacteristic else {
+        guard let commandCharacteristic else {
             return
         }
 
-        let shouldSend: Bool
+        let shouldConsiderSending: Bool
 
         if let lastX = lastSentCenterX,
            let lastY = lastSentCenterY {
             let xChange = abs(box.x - lastX)
             let yChange = abs(box.y - lastY)
 
-            shouldSend = xChange > xChangeThreshold || yChange > yChangeThreshold
+            shouldConsiderSending = xChange > xChangeThreshold || yChange > yChangeThreshold
         } else {
-            // Always send the first valid detection after the characteristic is ready.
-            shouldSend = true
+            shouldConsiderSending = true
         }
 
-        guard shouldSend else {
+        guard shouldConsiderSending else {
             return
         }
 
-        // Same idea as the Python code:
-        // error = target center - frame center
-        // angle command = -error * gain
         let errorX = box.x - targetCenterX
-        var angle = -errorX * angleGain
+        var rawAngle = errorX * angleGain
 
-        // Clamp the angle to match the Arduino sketch safety limits.
-        if angle < minAngle {
-            angle = minAngle
+        if rawAngle < minAngle {
+            rawAngle = minAngle
         }
 
-        if angle > maxAngle {
-            angle = maxAngle
+        if rawAngle > maxAngle {
+            rawAngle = maxAngle
         }
 
-        // Arduino command format:
-        // G<deg>\n
-        // Example: G-4.25
-        let message = String(format: "G%.2f\n", angle)
+        let filteredAngle: Double
+
+        if let previousSmoothedAngle = smoothedAngle {
+            filteredAngle = smoothingAlpha * rawAngle + (1.0 - smoothingAlpha) * previousSmoothedAngle
+        } else {
+            filteredAngle = rawAngle
+        }
+
+        smoothedAngle = filteredAngle
+
+        let now = Date()
+
+        if let lastSendTime,
+           now.timeIntervalSince(lastSendTime) < minimumSendInterval {
+            return
+        }
+
+        if let lastSentAngle,
+           abs(filteredAngle - lastSentAngle) < angleSendThreshold {
+            return
+        }
+
+        let message = String(format: "G%.2f\n", filteredAngle)
 
         guard let data = message.data(using: .utf8) else {
             return
@@ -107,16 +129,76 @@ final class BluetoothManager: NSObject, ObservableObject {
 
         arduinoPeripheral.writeValue(
             data,
-            for: boundingBoxCharacteristic,
+            for: commandCharacteristic,
             type: .withResponse
         )
 
         lastSentCenterX = box.x
         lastSentCenterY = box.y
+        lastSentAngle = filteredAngle
+        lastSendTime = now
 
         bluetoothStatus = "Sent: \(message)"
         print("Sent Dynamixel command: \(message)")
-        print("box.x: \(box.x), errorX: \(errorX), angle: \(angle)")
+        print("box.x: \(box.x), errorX: \(errorX), rawAngle: \(rawAngle), filteredAngle: \(filteredAngle)")
+    }
+
+    @discardableResult
+    func sendCommand(_ command: String) -> Bool {
+        guard let arduinoPeripheral else {
+            bluetoothStatus = "No Arduino connected"
+            return false
+        }
+
+        guard let commandCharacteristic else {
+            bluetoothStatus = "No command characteristic"
+            return false
+        }
+
+        let message = command.hasSuffix("\n") ? command : command + "\n"
+
+        guard let data = message.data(using: .utf8) else {
+            bluetoothStatus = "Could not encode command"
+            return false
+        }
+
+        arduinoPeripheral.writeValue(
+            data,
+            for: commandCharacteristic,
+            type: .withResponse
+        )
+
+        bluetoothStatus = "Sent: \(message)"
+        print("Sent command:", message)
+
+        return true
+    }
+
+    // Thumbs-up gesture calls this.
+    // It only pauses/resumes new movement commands.
+    // It does NOT send D/E, so the Dynamixel should keep holding its current position.
+    func toggleServoCommands() {
+        servoCommandsEnabled.toggle()
+
+        if servoCommandsEnabled {
+            bluetoothStatus = "Motor movement resumed"
+            print("Motor movement resumed: sending G commands again")
+        } else {
+            bluetoothStatus = "Motor movement paused"
+            print("Motor movement paused: holding current position")
+        }
+    }
+
+    // Open-palm gesture calls this.
+    // This still sends L<percent> to the Arduino to change LED brightness.
+    func cycleLedBrightness() {
+        ledBrightnessIndex = (ledBrightnessIndex + 1) % ledBrightnessLevels.count
+
+        let brightness = ledBrightnessLevels[ledBrightnessIndex]
+
+        if sendCommand("L\(brightness)") {
+            bluetoothStatus = "LED brightness: \(brightness)%"
+        }
     }
 }
 
@@ -126,12 +208,8 @@ extension BluetoothManager: CBCentralManagerDelegate {
         case .poweredOn:
             bluetoothStatus = "Bluetooth powered on. Scanning for Arduino..."
 
-            // LightBlue on the Mac is advertising the local name "Arduino",
-            // but not the custom service UUID, so we scan broadly for this test.
-            // For the real Arduino, we can switch this back to [serviceUUID]
-            // if the Arduino advertises the service UUID properly.
             central.scanForPeripherals(
-                withServices: nil,
+                withServices: [serviceUUID],
                 options: nil
             )
 
@@ -170,36 +248,23 @@ extension BluetoothManager: CBCentralManagerDelegate {
         let peripheralName = peripheral.name ?? "Unnamed device"
         let localName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
 
-        // LightBlue may show the peripheral name as the MacBook,
-        // while advertising "Arduino" as the local name.
-        guard localName == "Arduino" else {
-            return
-        }
-
-        // Avoid trying to connect repeatedly to the same device.
-        if arduinoPeripheral?.identifier == peripheral.identifier {
-            return
-        }
-
-        bluetoothStatus = "Found Arduino. Connecting..."
-
-        print("Found Arduino")
+        print("Found BLE peripheral with matching service")
         print("Peripheral name: \(peripheralName)")
         print("Advertisement local name: \(localName ?? "No local name")")
         print("Peripheral identifier: \(peripheral.identifier)")
         print("RSSI: \(RSSI)")
         print("Advertisement data: \(advertisementData)")
 
-        // Save the peripheral so Core Bluetooth keeps the connection target alive.
-        arduinoPeripheral = peripheral
+        if arduinoPeripheral?.identifier == peripheral.identifier {
+            return
+        }
 
-        // This is needed before we can discover services/characteristics.
+        bluetoothStatus = "Found Arduino. Connecting..."
+
+        arduinoPeripheral = peripheral
         arduinoPeripheral?.delegate = self
 
-        // Stop scanning now that we found the device we want.
         central.stopScan()
-
-        // Connect to the LightBlue fake Arduino.
         central.connect(peripheral, options: nil)
     }
 
@@ -212,7 +277,6 @@ extension BluetoothManager: CBCentralManagerDelegate {
 
         print("Connected to Arduino")
 
-        // Look for the custom RedefineLighting service.
         peripheral.discoverServices([serviceUUID])
     }
 
@@ -238,10 +302,15 @@ extension BluetoothManager: CBCentralManagerDelegate {
     ) {
         bluetoothStatus = "Disconnected from Arduino"
         isConnected = false
+
         arduinoPeripheral = nil
-        boundingBoxCharacteristic = nil
+        commandCharacteristic = nil
+
         lastSentCenterX = nil
         lastSentCenterY = nil
+        lastSentAngle = nil
+        smoothedAngle = nil
+        lastSendTime = nil
 
         print("Disconnected from Arduino")
 
@@ -249,9 +318,8 @@ extension BluetoothManager: CBCentralManagerDelegate {
             print("Disconnect error: \(error.localizedDescription)")
         }
 
-        // Start scanning again so the app can reconnect if the peripheral comes back.
         central.scanForPeripherals(
-            withServices: nil,
+            withServices: [serviceUUID],
             options: nil
         )
     }
@@ -310,10 +378,10 @@ extension BluetoothManager: CBPeripheralDelegate {
             print("Properties: \(characteristic.properties)")
 
             if characteristic.uuid == characteristicUUID {
-                boundingBoxCharacteristic = characteristic
+                commandCharacteristic = characteristic
                 bluetoothStatus = "Ready to send Dynamixel commands"
 
-                print("Bounding box / Dynamixel command characteristic found")
+                print("Dynamixel command characteristic found")
             }
         }
     }
