@@ -39,22 +39,6 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
     // Load the Core ML object detection model once.
     let mlModel = try? Redefine_Lighting_1(configuration: .init())
 
-    // -------------------- CAMERA EXPOSURE / SHUTTER TUNING --------------------
-    private let useCustomExposure = true
-    private let cameraFrameRate: Int32 = 30
-
-    // Change this to tune shutter:
-    // 60  = 1/60
-    // 120 = 1/120
-    // 240 = 1/240
-    // 360 = 1/360
-    // 480 = 1/480
-    private let exposureDenominator: Int32 = 240
-
-    // Raise this if the image gets too dark.
-    // Lower this if the image is overexposed.
-    private let exposureISO: Float = 200
-
     // -------------------- HAND POSE / GESTURE STATE --------------------
     @Published var handGesture: HandGesture = .none
 
@@ -147,11 +131,9 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
 
             videoQueue = queue
             output.setSampleBufferDelegate(self, queue: queue)
-            output.alwaysDiscardsLateVideoFrames = true
 
-            if useCustomExposure {
-                configureCameraExposure(camera)
-            }
+            // If processing falls behind, drop old frames instead of creating lag.
+            output.alwaysDiscardsLateVideoFrames = true
 
             session.commitConfiguration()
             isConfigured = true
@@ -159,72 +141,6 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
             session.commitConfiguration()
             print("Failed to configure camera: \(error)")
         }
-    }
-
-    private func configureCameraExposure(_ camera: AVCaptureDevice) {
-        do {
-            try camera.lockForConfiguration()
-
-            let desiredFrameDuration = CMTime(value: 1, timescale: cameraFrameRate)
-            let desiredFPS = Double(cameraFrameRate)
-
-            let supportsRequestedFrameRate = camera.activeFormat.videoSupportedFrameRateRanges.contains { range in
-                desiredFPS >= range.minFrameRate && desiredFPS <= range.maxFrameRate
-            }
-
-            if supportsRequestedFrameRate {
-                camera.activeVideoMinFrameDuration = desiredFrameDuration
-                camera.activeVideoMaxFrameDuration = desiredFrameDuration
-                print("Camera frame rate locked near \(cameraFrameRate) fps")
-            } else {
-                print("Requested frame rate \(cameraFrameRate) fps is not supported by active format")
-            }
-
-            let desiredExposureDuration = CMTime(value: 1, timescale: exposureDenominator)
-            let clampedDuration = clampedExposureDuration(desiredExposureDuration, for: camera)
-
-            let clampedISO = min(
-                max(exposureISO, camera.activeFormat.minISO),
-                camera.activeFormat.maxISO
-            )
-
-            if camera.isExposureModeSupported(.custom) {
-                camera.setExposureModeCustom(
-                    duration: clampedDuration,
-                    iso: clampedISO,
-                    completionHandler: nil
-                )
-
-                print("Custom exposure set:")
-                print("Exposure duration: 1/\(exposureDenominator) requested")
-                print("Actual duration seconds: \(CMTimeGetSeconds(clampedDuration))")
-                print("ISO: \(clampedISO)")
-            } else {
-                print("Custom exposure mode is not supported on this camera")
-            }
-
-            camera.unlockForConfiguration()
-        } catch {
-            print("Could not lock camera for exposure/frame-rate config: \(error)")
-        }
-    }
-
-    private func clampedExposureDuration(
-        _ desiredDuration: CMTime,
-        for camera: AVCaptureDevice
-    ) -> CMTime {
-        let minDuration = camera.activeFormat.minExposureDuration
-        let maxDuration = camera.activeFormat.maxExposureDuration
-
-        if CMTimeCompare(desiredDuration, minDuration) < 0 {
-            return minDuration
-        }
-
-        if CMTimeCompare(desiredDuration, maxDuration) > 0 {
-            return maxDuration
-        }
-
-        return desiredDuration
     }
 
     func startSession() {
@@ -280,7 +196,7 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
 
             self.runDetector(pixelBuffer)
 
-            print("END processing frame using detector only")
+            print("END processing frame using object detector only")
         }
     }
 
@@ -313,6 +229,8 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
         var bestIndex = -1
         var bestConfidence = -Double.infinity
 
+        // The model may return multiple detections.
+        // Keep the highest-confidence detection only.
         for r in 0..<output.confidence.shape[0].intValue {
             let c = output.confidence[[NSNumber(value: r), 0]].doubleValue
 
