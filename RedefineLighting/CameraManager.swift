@@ -11,6 +11,7 @@ import Combine
 import Dispatch
 import CoreML
 import Vision
+import CoreImage
 
 struct NormalizedBox: Equatable {
     let x: Double
@@ -36,13 +37,11 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
 
     private var isProcessingFrame = false
 
-    // Load the Core ML object detection model once.
     let mlModel = try? Redefine_Lighting_1(configuration: .init())
 
     // -------------------- HAND POSE / GESTURE STATE --------------------
     @Published var handGesture: HandGesture = .none
 
-    // ContentView watches this. It increments only when a held gesture fires.
     @Published var gestureEventID = 0
     @Published var lastGestureEvent: HandGesture = .none
 
@@ -57,6 +56,16 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
     private var stableGesture: HandGesture = .none
     private var stableGestureStartTime: Date?
     private var didFireHeldGesture = false
+
+    // -------------------- DASHBOARD VIDEO STREAM STATE --------------------
+    @Published var dashboardFrameBase64: String?
+    @Published var dashboardFrameID = 0
+    @Published var dashboardFrameWidth = 0
+    @Published var dashboardFrameHeight = 0
+
+    private let dashboardFrameEveryNFrames = 10
+    private let dashboardJPEGQuality: CGFloat = 0.45
+    private let ciContext = CIContext()
 
     // -------------------- PUBLISHED UI STATE --------------------
     @Published var permissionDenied = false
@@ -131,8 +140,6 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
 
             videoQueue = queue
             output.setSampleBufferDelegate(self, queue: queue)
-
-            // If processing falls behind, drop old frames instead of creating lag.
             output.alwaysDiscardsLateVideoFrames = true
 
             session.commitConfiguration()
@@ -190,6 +197,10 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
 
             self.frameCounter += 1
 
+            if self.frameCounter % self.dashboardFrameEveryNFrames == 0 {
+                self.createDashboardFrame(pixelBuffer)
+            }
+
             if self.frameCounter % self.handPoseEveryNFrames == 0 {
                 self.runHandPose(pixelBuffer)
             }
@@ -197,6 +208,38 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
             self.runDetector(pixelBuffer)
 
             print("END processing frame using object detector only")
+        }
+    }
+
+    // -------------------- DASHBOARD VIDEO --------------------
+
+    private func createDashboardFrame(_ pixelBuffer: CVPixelBuffer) {
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+
+        guard let cgImage = ciContext.createCGImage(
+            ciImage,
+            from: ciImage.extent
+        ) else {
+            print("Could not create dashboard CGImage")
+            return
+        }
+
+        let uiImage = UIImage(cgImage: cgImage)
+
+        guard let jpegData = uiImage.jpegData(compressionQuality: dashboardJPEGQuality) else {
+            print("Could not create dashboard JPEG")
+            return
+        }
+
+        let base64 = jpegData.base64EncodedString()
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+
+        DispatchQueue.main.async {
+            self.dashboardFrameBase64 = base64
+            self.dashboardFrameWidth = width
+            self.dashboardFrameHeight = height
+            self.dashboardFrameID += 1
         }
     }
 
@@ -229,8 +272,6 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
         var bestIndex = -1
         var bestConfidence = -Double.infinity
 
-        // The model may return multiple detections.
-        // Keep the highest-confidence detection only.
         for r in 0..<output.confidence.shape[0].intValue {
             let c = output.confidence[[NSNumber(value: r), 0]].doubleValue
 
