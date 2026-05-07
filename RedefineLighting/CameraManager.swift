@@ -14,7 +14,7 @@ import CoreML
 // This struct stores one detection from the model in a simple Swift type.
 // The model gives normalized values, so x, y, width, and height are all
 // relative to the image size rather than absolute pixel values.
-struct NormalizedBox {
+struct NormalizedBox: Equatable{
     let x: Double
     let y: Double
     let width: Double
